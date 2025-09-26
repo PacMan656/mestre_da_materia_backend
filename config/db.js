@@ -1,21 +1,24 @@
+// db.js
+const { PrismaClient } = require('@prisma/client');
 
-const mysql = require('mysql2');
+const prisma = new PrismaClient();
 
-const pool = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: 'senha',
-  database: 'mestre_da_materia',
-});
-
-pool.getConnection((err, connection) => {
-  if (err) {
-    console.error('Erro de conexão:', err.stack);
-  } else {
-    console.log('Conectado ao banco de dados MySQL com sucesso!');
-    connection.release();
+// Teste de conexão (equivalente ao getConnection do mysql2)
+async function testConnection() {
+  try {
+    // consulta simples; se falhar, lança erro
+    await prisma.$queryRaw`SELECT 1`;
+    console.log('Conectado ao banco de dados PostgreSQL com sucesso (Prisma)!');
+  } catch (err) {
+    console.error('Erro de conexão com PostgreSQL:', err);
   }
+}
+
+// Encerrar corretamente ao finalizar o processo
+process.on('beforeExit', async () => {
+  await prisma.$disconnect();
 });
 
-module.exports = pool;
-    
+testConnection();
+
+module.exports = prisma;
