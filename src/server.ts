@@ -1,119 +1,142 @@
-// 1. IMPORTAÇÕES DAS BIBLIOTECAS
+// 1. IMPORTAÇÕES
 const express = require('express');
-const admin = require('firebase-admin');
-const jwt = require('jsonwebtoken');
 const cors = require('cors');
-require('dotenv').config(); // Carrega variáveis de ambiente do .env
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const { PrismaClient } = require('@prisma/client');
+require('dotenv').config();
 
-// 2. CONFIGURAÇÕES INICIAIS
+// 2. APP / CONFIG
 const app = express();
-const PORT = process.env.PORT || 3001; // Define a porta
+const PORT = process.env.PORT || 3001;
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 
 app.use(express.json());
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
+    credentials: true,
+  })
+);
 
-// Configuração do CORS para permitir o frontend
-const corsOptions = {
-  origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
-};
-app.use(cors(corsOptions));
+// 3. PRISMA (Postgres)
+const prisma = new PrismaClient();
 
-// Chave secreta para o JWT
-const JWT_SECRET = process.env.JWT_SECRET;
-
-// 3. INICIALIZAÇÃO DO FIREBASE ADMIN
-// =================== AJUSTE PRINCIPAL AQUI ===================
-// Monta o objeto de credencial a partir das variáveis de ambiente separadas
-try {
-  // Garantir que a chave privada exista e tenha o tipo correto antes de usar .replace
-  const rawPrivateKey = process.env.FIREBASE_PRIVATE_KEY;
-  if (!rawPrivateKey) {
-    throw new Error('FIREBASE_PRIVATE_KEY não está definida nas variáveis de ambiente.');
+(async () => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    console.log('✅ Conectado ao PostgreSQL com Prisma!');
+  } catch (err) {
+    console.error('❌ Erro ao conectar no PostgreSQL:', err);
   }
+})();
 
-  const serviceAccount = {
-    type: process.env.FIREBASE_TYPE,
-    project_id: process.env.FIREBASE_PROJECT_ID,
-    private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-    // A linha abaixo é CRUCIAL para formatar a chave privada corretamente
-    private_key: rawPrivateKey.replace(/\\n/g, '\n'),
-    client_email: process.env.FIREBASE_CLIENT_EMAIL,
-    client_id: process.env.FIREBASE_CLIENT_ID,
-    auth_uri: process.env.FIREBASE_AUTH_URI,
-    token_uri: process.env.FIREBASE_TOKEN_URI,
-    auth_provider_x509_cert_url: process.env.FIREBASE_AUTH_PROVIDER_X509_CERT_URL,
-    client_x509_cert_url: process.env.FIREBASE_CLIENT_X509_CERT_URL,
-    universe_domain: process.env.FIREBASE_UNIVERSE_DOMAIN,
-  };
-
-  // Verifica se o app já foi inicializado (importante para ambientes serverless)
-  if (!admin.apps.length) {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-    console.log('Firebase Admin SDK inicializado com sucesso!');
-  }
-} catch (error: any) {
-  console.error('ERRO FATAL ao inicializar Firebase Admin SDK. Verifique suas variáveis de ambiente.', error);
+// 4. HELPERS
+function signToken(payload: any) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' });
 }
-// =================== FIM DO AJUSTE ===================
 
-const db = admin.firestore(); // Instância do Firestore
+// Middleware para rotas protegidas
+function auth(req: any, res: any, next: any) {
+  try {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ message: 'Token não fornecido.' });
 
-// 4. ROTA DE CADASTRO DE USUÁRIO COM FIREBASE
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded; // { id, email, name }
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: 'Token inválido ou expirado.' });
+  }
+}
+
+// 5. ROTAS
+
+// Registro: cria usuário no Postgres com senha hasheada
 app.post('/api/register', async (req: any, res: any) => {
   try {
-    const { name, email, password } = req.body;
-
+    const { name, email, password } = req.body || {};
     if (!name || !email || !password) {
-      return res.status(400).json({ message: 'Por favor, preencha todos os campos.' });
+      return res.status(400).json({ message: 'Por favor, preencha name, email e password.' });
     }
 
-    // a. Cria o usuário no Firebase Authentication
-    const userRecord = await admin.auth().createUser({
-      email: email,
-      password: password,
-      displayName: name,
-    });
-
-    // b. Salva informações adicionais no Firestore
-    await db.collection('users').doc(userRecord.uid).set({
-      name: name,
-      email: email,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    // c. Gera um Token JWT
-    const token = jwt.sign({ id: userRecord.uid, name: name }, JWT_SECRET, {
-      expiresIn: '1h',
-    });
-
-    // d. Envia a resposta de sucesso
-    res.status(201).json({
-      message: 'Usuário criado com sucesso!',
-      token: token,
-      user: {
-        id: userRecord.uid,
-        name: name,
-        email: email,
-      },
-    });
-
-  } catch (error: any) {
-    console.error('Erro no servidor ao registrar usuário:', error);
-    if (error.code === 'auth/email-already-exists') {
+    const exists = await prisma.user.findUnique({ where: { email } });
+    if (exists) {
       return res.status(409).json({ message: 'Este e-mail já está em uso.' });
     }
-    res.status(500).json({ message: 'Ocorreu um erro no servidor. Tente novamente mais tarde.' });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const user = await prisma.user.create({
+      data: { name, email, passwordHash },
+      select: { id: true, name: true, email: true, createdAt: true },
+    });
+
+    const token = signToken({ id: user.id, email: user.email, name: user.name });
+
+    res.status(201).json({
+      message: 'Usuário criado com sucesso!',
+      token,
+      user,
+    });
+  } catch (err) {
+    console.error('Erro no /api/register:', err);
+    res.status(500).json({ message: 'Erro no servidor ao registrar usuário.' });
   }
 });
 
-// Adicione aqui outras rotas (ex: /api/login)
+// Login: valida senha e retorna JWT
+app.post('/api/login', async (req: any, res: any) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Por favor, informe email e password.' });
+    }
 
-// 5. INICIA O SERVIDOR (PARA TESTES LOCAIS)
-// A Vercel ignora esta parte e usa a exportação abaixo
-app.listen(PORT, () => {
-  console.log(`🚀 Servidor rodando na porta ${PORT}`);
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return res.status(401).json({ message: 'Credenciais inválidas.' });
+
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) return res.status(401).json({ message: 'Credenciais inválidas.' });
+
+    const token = signToken({ id: user.id, email: user.email, name: user.name });
+
+    res.json({
+      message: 'Login realizado com sucesso!',
+      token,
+      user: { id: user.id, name: user.name, email: user.email, createdAt: user.createdAt },
+    });
+  } catch (err) {
+    console.error('Erro no /api/login:', err);
+    res.status(500).json({ message: 'Erro no servidor ao fazer login.' });
+  }
 });
 
-// 6. EXPORTAÇÃO DO APP PARA A VERCEL
+// Rota protegida: dados do usuário autenticado
+app.get('/api/me', auth, async (req: any, res: any) => {
+  try {
+    const me = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { id: true, name: true, email: true, createdAt: true },
+    });
+    if (!me) return res.status(404).json({ message: 'Usuário não encontrado.' });
+    res.json(me);
+  } catch (err) {
+    console.error('Erro no /api/me:', err);
+    res.status(500).json({ message: 'Erro no servidor.' });
+  }
+});
+
+// 6. INICIA (local)
+// (Na Vercel, normalmente você usaria API Routes. Se mantiver este servidor,
+// a Vercel ignora o listen e usa a exportação do app.)
+app.listen(PORT, () => console.log(`🚀 Servidor rodando na porta ${PORT}`));
+
+// 7. ENCERRAMENTO LIMPO
+process.on('beforeExit', async () => {
+  await prisma.$disconnect();
+});
+
+// 8. EXPORT PARA VERCEL
 module.exports = app;
